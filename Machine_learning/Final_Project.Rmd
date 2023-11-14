@@ -1,0 +1,188 @@
+---
+title: "MKTG 6620"
+author: "Karson Eilers"
+date: "`r Sys.Date()`"
+output: html_document:
+  toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Packages
+library(caret)
+library(tidyverse)
+library(pROC)
+library(glmnet)
+library(tidymodels)
+library(xgboost)
+library(doParallel)
+library(rsample)
+library(vip)
+library(DALEXtra)
+
+```
+
+# TODO: 
+1) pre-processed features for logistic regression
+2) implement base logistic regression
+3) Test for multicollinearity using VIF and correlation plot
+4) Correlation plot to look for multicollinearity
+
+5) pre-process (standardize) data for XG boost model
+6) Add DALEX partial dependence plots exploring key features
+
+
+
+
+```{r df_setup}
+OJ <- read.csv(url("http://data.mishra.us/files/project/OJ_data.csv"))
+OJ[2:14] <- lapply(OJ[2:14], as.numeric)
+#TEMP
+OJ[2:14] <- lapply(OJ[1:14], as.numeric)
+#TEMP
+OJ$Purchase <- as.factor(OJ$Purchase)
+sapply(OJ,class)
+
+summary(OJ)
+```
+
+```{r partition}
+#setting seed
+set.seed(123)
+
+#creating index for train data
+train_index <- createDataPartition(OJ$Purchase, 
+                                   p=0.8, 
+                                   list=FALSE,
+                                   times=1)
+
+#creating train and test sets from OJ datasaet
+OJ_train <- OJ[train_index,]
+OJ_test <- OJ[-train_index,]
+
+#Checking distributions
+print("Import proportion")
+prop.table(table(OJ$Purchase))*100
+print("<----------------------->")
+
+print("Train set proportion")
+prop.table(table(OJ_train$Purchase))*100
+print("<----------------------->")
+
+print("Test set proportion")
+prop.table(table(OJ_test$Purchase))*100
+print("<----------------------->")
+
+
+
+```
+
+
+
+```{r}
+y1 <- OJ_train[,1]
+x1 <- data.matrix(OJ_train[,2:14])
+m1 <- cv.glmnet(x = x1, y = y1, data = OJ, family='binomial', alpha=1)
+coef(m1)
+
+instplot(m1)
+
+m1_predictions <- predict(m1, data.matrix(OJ_test[2:14]), type="response")
+
+m1_predictions <- data.frame(m1_predictions)
+
+m1_predictions <- m1_predictions %>%
+  mutate(preds = ifelse(m1_predictions > 0.5,1,0))
+
+m1_auc <- auc(OJ_test$Purchase, m1_predictions$preds)
+
+plot(roc_m1)
+
+
+```
+
+
+```{r}
+#Boosted Decision Tree
+OJ$Purchase <- as.factor(OJ$Purchase)
+OJ_testtrn <- initial_split(OJ, prop=0.8, 
+                            strata = Purchase)
+
+OJ_train2 <- training(OJ_testtrn)
+OJ_test2 <- testing(OJ_testtrn)
+
+set.seed(123)
+
+rec_OJ <- recipe(Purchase ~ ., OJ_train2) %>%
+  prep(training = OJ_train2)
+
+m3 <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()) %>%
+  set_engine("xgboost", verbosity = 0) %>%
+  set_mode("classification")
+
+hyper_grid <- grid_regular(
+  trees(),
+  tree_depth(),
+  learn_rate(),
+  levels=4)
+
+oj_folds <- vfold_cv(OJ_train2, v=5)
+
+oj_wf <- workflow() %>%
+  add_model(m3) %>%
+  add_recipe(rec_OJ)
+
+doParallel::registerDoParallel(cores=10)
+
+set.seed(123)
+OJ_tune <-
+  oj_wf %>%
+  tune_grid(
+    resamples = oj_folds,
+    grid=hyper_grid,
+    metrics = metric_set(accuracy)
+  )
+
+best_model <- OJ_tune %>%
+  select_best("accuracy")
+
+best_model
+
+final_workflow <-
+  oj_wf %>%
+  finalize_workflow(best_model)
+
+final_fit <-
+  final_workflow %>%
+  last_fit(split = OJ_testtrn)
+
+final_fit %>%
+  collect_metrics()
+
+final_workflow %>%
+  fit(data = OJ_train2) %>%
+  extract_fit_parsnip() %>%
+  vip(geom="point")
+
+
+
+
+```
+
+
+
+```{r}
+model_fitted <- final_workflow %>%
+  fit(data = OJ_test2)
+
+explainer_rf <- explain_tidymodels(model_fitted,
+                                   data = )
+
+
+```
