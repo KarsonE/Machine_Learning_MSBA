@@ -2,15 +2,16 @@
 title: "MKTG 6620"
 author: "Karson Eilers"
 date: "`r Sys.Date()`"
-output: html_document:
-  toc: true
+output: 
+  html_document:
+    toc: true
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r}
+```{r message=FALSE}
 #Packages
 library(caret)
 library(tidyverse)
@@ -22,34 +23,77 @@ library(doParallel)
 library(rsample)
 library(vip)
 library(DALEXtra)
+library(corrplot)
+library(car)
 
 ```
-
-# TODO: 
-1) pre-processed features for logistic regression
-2) implement base logistic regression
-3) Test for multicollinearity using VIF and correlation plot
-4) Correlation plot to look for multicollinearity
-
-5) pre-process (standardize) data for XG boost model
-6) Add DALEX partial dependence plots exploring key features
-
-
 
 
 ```{r df_setup}
+#imports dataset
 OJ <- read.csv(url("http://data.mishra.us/files/project/OJ_data.csv"))
+
+#casts variables as their approriate types
 OJ[2:14] <- lapply(OJ[2:14], as.numeric)
-#TEMP
-OJ[2:14] <- lapply(OJ[1:14], as.numeric)
-#TEMP
 OJ$Purchase <- as.factor(OJ$Purchase)
 sapply(OJ,class)
 
+#summarizes the different variables
 summary(OJ)
+
 ```
 
-```{r partition}
+
+```{r logistic}
+#Creates m1, an explanatory logistic regression model based on all predictor variables
+m1 <- glm(Purchase ~ ., data=OJ, family='binomial')
+
+#summarizes m1
+summary(m1)
+
+```
+
+```{r correlation}
+#calculates correlation matrix of predictor variables
+OJ.cor <- cor(OJ[2:14])
+
+#plots the correlation matrix
+corrplot(OJ.cor)
+
+```
+
+
+```{r multicollinear_fix}
+#Remove the 6 multicollinear variables
+OJ <- OJ %>%
+  select(-c(SalePriceMM, SalePriceCH, PriceDiff, PctDiscCH, PctDiscMM, ListPriceDiff))
+
+# recreates m1 with the updated dataset
+m1 <- glm(Purchase ~ ., data=OJ, family='binomial')
+
+#summarizes m1
+summary(m1)
+
+#performs variance inflation factor test to check for remaining multicollinearity
+vif(m1)
+
+```
+
+```{r pre-processing}
+#Scales the continuous variables for predictive modeling
+OJ <- OJ %>%
+  mutate(
+    PriceCH = scale(PriceCH),
+    PriceMM = scale(PriceMM),
+    DiscCH = scale(DiscCH),
+    DiscMM = scale(DiscMM),
+    LoyalCH = scale(LoyalCH)
+  )
+
+```
+
+
+```{r partitions}
 #setting seed
 set.seed(123)
 
@@ -63,62 +107,70 @@ train_index <- createDataPartition(OJ$Purchase,
 OJ_train <- OJ[train_index,]
 OJ_test <- OJ[-train_index,]
 
-#Checking distributions
-print("Import proportion")
-prop.table(table(OJ$Purchase))*100
-print("<----------------------->")
-
-print("Train set proportion")
-prop.table(table(OJ_train$Purchase))*100
-print("<----------------------->")
-
-print("Test set proportion")
-prop.table(table(OJ_test$Purchase))*100
-print("<----------------------->")
+```
 
 
+```{r logistic_lasso}
+#selects the target variable
+y <- OJ_train[,1]
+
+#selects predictor variables
+x <- data.matrix(OJ_train[,2:8])
+
+#creates m2, a cross-validated LASSO regression model
+m2 <- cv.glmnet(x = x, y = y, data = OJ_train, family='binomial', alpha=1)
+
+#calls coefficients for m2
+coef(m2)
+
+#plots m2
+plot(m2)
+
+#stores model predictions on test data
+m2_predictions <- predict(m2, data.matrix(OJ_test[2:8]), type="response")
+
+#converts model predictions to a dataframe
+m2_predictions <- data.frame(m2_predictions)
+
+#uses 0.5 probability threshold for CH and MM purchases
+m2_predictions <- m2_predictions %>%
+  mutate(preds = ifelse(m2_predictions > 0.5,1,0))
+
+#calculates AUC value
+m2_auc <- auc(OJ_test$Purchase, m2_predictions$preds)
+print(m2_auc)
+
+#creates a confusion matrix with predictions and actual values
+cm <- confusionMatrix(data=as.factor(m2_predictions$preds), reference=OJ_test$Purchase)
+print(cm)
+
+#plots the ROC-AUC curve for m2
+plot(roc(OJ_test$Purchase, m2_predictions$preds))
 
 ```
 
 
-
-```{r}
-y1 <- OJ_train[,1]
-x1 <- data.matrix(OJ_train[,2:14])
-m1 <- cv.glmnet(x = x1, y = y1, data = OJ, family='binomial', alpha=1)
-coef(m1)
-
-instplot(m1)
-
-m1_predictions <- predict(m1, data.matrix(OJ_test[2:14]), type="response")
-
-m1_predictions <- data.frame(m1_predictions)
-
-m1_predictions <- m1_predictions %>%
-  mutate(preds = ifelse(m1_predictions > 0.5,1,0))
-
-m1_auc <- auc(OJ_test$Purchase, m1_predictions$preds)
-
-plot(roc_m1)
-
-
-```
-
-
-```{r}
+```{r boosted_tree}
 #Boosted Decision Tree
-OJ$Purchase <- as.factor(OJ$Purchase)
+#OJ$Purchase <- as.factor(OJ$Purchase)
+
+#note - workflow requires paritioning using this method
+#splits train/test data using split method, same partition rates as m2
 OJ_testtrn <- initial_split(OJ, prop=0.8, 
                             strata = Purchase)
 
+#boosted tree partitions 
 OJ_train2 <- training(OJ_testtrn)
 OJ_test2 <- testing(OJ_testtrn)
 
+#sets seed at 123
 set.seed(123)
 
+#creates the workflow recipe
 rec_OJ <- recipe(Purchase ~ ., OJ_train2) %>%
   prep(training = OJ_train2)
 
+#creates the boosted tree model m3
 m3 <- boost_tree(
   trees = tune(),
   tree_depth = tune(),
@@ -126,20 +178,25 @@ m3 <- boost_tree(
   set_engine("xgboost", verbosity = 0) %>%
   set_mode("classification")
 
+#creates grid search to determine hyperparameters
 hyper_grid <- grid_regular(
   trees(),
   tree_depth(),
   learn_rate(),
   levels=4)
 
+#cross validation iterations
 oj_folds <- vfold_cv(OJ_train2, v=5)
 
+#creates workflow
 oj_wf <- workflow() %>%
   add_model(m3) %>%
   add_recipe(rec_OJ)
 
+#establishes paralell processing
 doParallel::registerDoParallel(cores=10)
 
+#tunes model per gridsearch hyperparameters
 set.seed(123)
 OJ_tune <-
   oj_wf %>%
@@ -149,40 +206,65 @@ OJ_tune <-
     metrics = metric_set(accuracy)
   )
 
+#selects the optimized model
 best_model <- OJ_tune %>%
   select_best("accuracy")
 
-best_model
-
+#performs final workflow on the optimized model
 final_workflow <-
   oj_wf %>%
   finalize_workflow(best_model)
 
+#selects the fit (predictions) from the final model
 final_fit <-
   final_workflow %>%
   last_fit(split = OJ_testtrn)
 
+#collects metrics from the final model fit
 final_fit %>%
   collect_metrics()
 
+#plots the importance of different predictor variables
 final_workflow %>%
   fit(data = OJ_train2) %>%
   extract_fit_parsnip() %>%
   vip(geom="point")
 
 
-
-
 ```
 
 
 
-```{r}
+```{r boosted_explainers}
+#selects fitted model
 model_fitted <- final_workflow %>%
-  fit(data = OJ_test2)
+  fit(data = OJ_train2)
 
+#creates explainer random forest from optimized model
 explainer_rf <- explain_tidymodels(model_fitted,
-                                   data = )
+                                   data = OJ_train2,
+                                   y=OJ_train2$Purchase,
+                                   type="pdp", verbose = FALSE)
 
+#creates pdp to understand effect of LoyalCH value
+pdp_loyalty <- model_profile(explainer_rf,
+                             variables = "LoyalCH", N=NULL)
+#plots loyalty pdp
+plot(pdp_loyalty)
+
+#creates pdp to understsand effects of both MM and CH discounts
+pdp_discount <- model_profile(explainer_rf, 
+                              variables= c("DiscMM","DiscCH"), N=NULL)
+
+#plots discount pdp
+plot(pdp_discount)
 
 ```
+
+
+
+
+
+
+
+
