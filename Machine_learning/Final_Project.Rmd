@@ -228,8 +228,12 @@ final_fit %>%
 final_workflow %>%
   fit(data = OJ_train2) %>%
   extract_fit_parsnip() %>%
-  vip(geom="point")
+  vip(geom="col")
 
+final_workflow %>%
+  fit(data = OJ_train2) %>%
+  extract_fit_parsnip() %>%
+  vi
 
 ```
 
